@@ -81,6 +81,9 @@ func startTelegramBot() {
 		log.Fatalf("Ошибка получения обновлений Telegram: %v", err)
 	}
 
+	var autoPingStarted bool
+	var savedChatID int64
+
 	for update := range updates {
 		if update.Message == nil {
 			continue
@@ -89,6 +92,13 @@ func startTelegramBot() {
 		switch strings.ToLower(update.Message.Text) {
 		case "/status":
 			handleStatusCommandAsync(bot, update.Message.Chat.ID)
+
+			// Запуск автоматического пинга, если еще не запущен
+			if !autoPingStarted {
+				autoPingStarted = true
+				savedChatID = update.Message.Chat.ID
+				go startAutoPing(bot, savedChatID)
+			}
 		}
 	}
 }
@@ -234,7 +244,7 @@ func createDefaultConfig() {
 		LogDir:           "logs",
 		PingInterval:     10, //частота запросов статуса пользователем
 		LogRetentionDays: 5,
-		TelegramBotToken: "ВАШ ТОКЕН",
+		TelegramBotToken: "токен",
 		PingTimeout:      10, //время, которое программа ждёт ответа от устройства при выполнении проверки пингом
 	}
 
@@ -248,5 +258,16 @@ func createDefaultConfig() {
 	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(config); err != nil {
 		log.Fatalf("Ошибка записи конфигурационного файла: %v", err)
+	}
+}
+
+func startAutoPing(bot *tgbotapi.BotAPI, chatID int64) {
+	ticker := time.NewTicker(30 * time.Minute) // Пинг каждые 30 минут
+	defer ticker.Stop()
+
+	for range ticker.C {
+		response := handleStatusCommand()
+		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Автоматический статус: %s", response))
+		bot.Send(msg)
 	}
 }
