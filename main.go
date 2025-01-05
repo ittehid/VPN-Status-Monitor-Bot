@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/getlantern/systray"
@@ -16,18 +17,21 @@ import (
 )
 
 type Config struct {
-	VPNClientIP      string `json:"vpn_client_ip"`
-	LogDir           string `json:"log_dir"`
-	PingInterval     int    `json:"ping_interval"`
-	LogRetentionDays int    `json:"log_retention_days"`
-	TelegramBotToken string `json:"telegram_bot_token"`
-	PingTimeout      int    `json:"ping_timeout"`
+	VPNClientIP             string `json:"vpn_client_ip"`
+	LogDir                  string `json:"log_dir"`
+	PingInterval            int    `json:"ping_interval"`
+	LogRetentionDays        int    `json:"log_retention_days"`
+	TelegramBotToken        string `json:"telegram_bot_token"`
+	PingTimeout             int    `json:"ping_timeout"`
+	AutoPingIntervalMinutes int    `json:"auto_ping_interval_minutes"`
+	EnableAutoPing          bool   `json:"enable_auto_ping"`
 }
 
 var (
 	config       Config
 	lastPingTime time.Time
 	configPath   = "config.json"
+	chatIDs      sync.Map // Хранение ID чатов для рассылки уведомлений
 )
 
 //go:embed assets/icon.ico
@@ -48,8 +52,6 @@ func main() {
 }
 
 func onReady() {
-
-	// Устанавливаем иконку в системный трей
 	systray.SetIcon(iconData)
 	systray.SetTooltip("VPN Статус")
 	quitItem := systray.AddMenuItem("Выйти", "Выход из программы")
@@ -60,9 +62,7 @@ func onReady() {
 	}()
 }
 
-func onExit() {
-	// Очистка ресурсов при выходе
-}
+func onExit() {}
 
 func startTelegramBot() {
 	bot, err := tgbotapi.NewBotAPI(config.TelegramBotToken)
@@ -81,30 +81,36 @@ func startTelegramBot() {
 		log.Fatalf("Ошибка получения обновлений Telegram: %v", err)
 	}
 
-	var autoPingStarted bool
-	var savedChatID int64
+	if config.EnableAutoPing {
+		go startAutoPing(bot)
+	}
 
 	for update := range updates {
 		if update.Message == nil {
 			continue
 		}
 
+		chatID := update.Message.Chat.ID
+		chatIDs.Store(chatID, true) // Сохраняем ID чата для рассылки
+
 		switch strings.ToLower(update.Message.Text) {
 		case "/status":
-			handleStatusCommandAsync(bot, update.Message.Chat.ID)
-
-			// Запуск автоматического пинга, если еще не запущен
-			if !autoPingStarted {
-				autoPingStarted = true
-				savedChatID = update.Message.Chat.ID
-				go startAutoPing(bot, savedChatID)
-			}
+			handleStatusCommandAsync(bot, chatID)
+		case "/enable_autoping":
+			config.EnableAutoPing = true
+			saveConfig()
+			msg := tgbotapi.NewMessage(chatID, "Автоматический пинг включен.")
+			bot.Send(msg)
+		case "/disable_autoping":
+			config.EnableAutoPing = false
+			saveConfig()
+			msg := tgbotapi.NewMessage(chatID, "Автоматический пинг отключен.")
+			bot.Send(msg)
 		}
 	}
 }
 
 func handleStatusCommandAsync(bot *tgbotapi.BotAPI, chatID int64) {
-	// Проверяем интервал перед началом проверки
 	if time.Since(lastPingTime) < time.Duration(config.PingInterval)*time.Second {
 		waitTime := config.PingInterval - int(time.Since(lastPingTime).Seconds())
 		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Подождите %d секунд перед следующей проверкой.", waitTime))
@@ -112,25 +118,18 @@ func handleStatusCommandAsync(bot *tgbotapi.BotAPI, chatID int64) {
 		return
 	}
 
-	// Обновляем временную метку перед началом проверки
 	lastPingTime = time.Now()
-
-	// Сообщаем, что проверяем статус
 	msg := tgbotapi.NewMessage(chatID, "Проверяю статус, подождите...")
 	bot.Send(msg)
 
-	// Выполняем проверку статуса
 	response := handleStatusCommand()
-
-	// Отправляем результат
 	resultMsg := tgbotapi.NewMessage(chatID, response)
 	bot.Send(resultMsg)
 }
 
 func handleStatusCommand() string {
-	// Выполняем пинг
 	if isClientOnline(config.VPNClientIP) {
-		lastPingTime = time.Now() // Обновляем временную метку только при успехе
+		lastPingTime = time.Now()
 		logStatus("Клиент в сети.")
 		return "Клиент в сети."
 	}
@@ -146,9 +145,9 @@ func isClientOnline(ip string) bool {
 		return false
 	}
 
-	pinger.Count = 3 // Отправляем 3 пакета для проверки
+	pinger.Count = 3
 	pinger.Timeout = time.Duration(config.PingTimeout) * time.Second
-	pinger.SetPrivileged(true) // Требуется для ICMP
+	pinger.SetPrivileged(true)
 
 	err = pinger.Run()
 	if err != nil {
@@ -161,6 +160,24 @@ func isClientOnline(ip string) bool {
 		stats.PacketsSent, stats.PacketsRecv, stats.PacketLoss, stats.AvgRtt.Milliseconds())
 
 	return stats.PacketsRecv > 0
+}
+
+func startAutoPing(bot *tgbotapi.BotAPI) {
+	ticker := time.NewTicker(time.Duration(config.AutoPingIntervalMinutes) * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		<-ticker.C
+		if config.EnableAutoPing {
+			response := handleStatusCommand()
+			chatIDs.Range(func(key, value any) bool {
+				chatID := key.(int64)
+				msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Автоматический статус: %s", response))
+				bot.Send(msg)
+				return true
+			})
+		}
+	}
 }
 
 func setupLogs() {
@@ -240,12 +257,14 @@ func loadConfig() {
 
 func createDefaultConfig() {
 	config = Config{
-		VPNClientIP:      "10.9.0.2",
-		LogDir:           "logs",
-		PingInterval:     10, //частота запросов статуса пользователем
-		LogRetentionDays: 5,
-		TelegramBotToken: "токен",
-		PingTimeout:      10, //время, которое программа ждёт ответа от устройства при выполнении проверки пингом
+		VPNClientIP:             "10.9.0.2",
+		LogDir:                  "logs",
+		PingInterval:            10,
+		LogRetentionDays:        5,
+		TelegramBotToken:        "ВАШ_ТЕЛЕГРАМ_ТОКЕН",
+		PingTimeout:             10,
+		AutoPingIntervalMinutes: 30,
+		EnableAutoPing:          true,
 	}
 
 	file, err := os.Create(configPath)
@@ -256,18 +275,22 @@ func createDefaultConfig() {
 
 	encoder := json.NewEncoder(file)
 	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(config); err != nil {
+	if err := encoder.Encode(&config); err != nil {
 		log.Fatalf("Ошибка записи конфигурационного файла: %v", err)
 	}
 }
 
-func startAutoPing(bot *tgbotapi.BotAPI, chatID int64) {
-	ticker := time.NewTicker(30 * time.Minute) // Пинг каждые 30 минут
-	defer ticker.Stop()
+func saveConfig() {
+	file, err := os.Create(configPath)
+	if err != nil {
+		log.Printf("Ошибка сохранения конфигурационного файла: %v", err)
+		return
+	}
+	defer file.Close()
 
-	for range ticker.C {
-		response := handleStatusCommand()
-		msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Автоматический статус: %s", response))
-		bot.Send(msg)
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(&config); err != nil {
+		log.Printf("Ошибка записи конфигурационного файла: %v", err)
 	}
 }
