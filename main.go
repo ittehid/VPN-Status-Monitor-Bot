@@ -106,6 +106,14 @@ func startTelegramBot() {
 			saveConfig()
 			msg := tgbotapi.NewMessage(chatID, "Автоматический пинг отключен.")
 			bot.Send(msg)
+		case "/status_autoping":
+			if config.EnableAutoPing == true {
+				msg := tgbotapi.NewMessage(chatID, "Автоматический пинг включен.")
+				bot.Send(msg)
+			} else {
+				msg := tgbotapi.NewMessage(chatID, "Автоматический пинг отключен.")
+				bot.Send(msg)
+			}
 		}
 	}
 }
